@@ -1,0 +1,162 @@
+- name: Configure Nodes
+  hosts: all
+  become: true
+  tasks:
+
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Download k3s Installation Script
+      get_url:
+        url: https://get.k3s.io
+        dest: /tmp/get-k3s.sh
+        mode: 'u=rwx,g=rx,o=rx'
+    
+    - name: Check if running in systemd environment
+      stat:
+        path: /run/systemd/system
+      register: systemd_check
+
+    - name: Install k3s on Master Node (with systemd)
+      when: "'master' in group_names and systemd_check.stat.exists"
+      run_once: true
+      environment:
+        K3S_TOKEN: "{{ lookup('env','K3S_TOKEN') }}"
+      shell: >
+        sh /tmp/get-k3s.sh server --cluster-init \
+          --node-external-ip={{ ansible_default_ipv4.address }} \
+          --flannel-backend=wireguard-native \
+          --flannel-external-ip
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+
+    - name: Install k3s on Master Node (without systemd)
+      when: "'master' in group_names and not systemd_check.stat.exists"
+      run_once: true
+      environment:
+        K3S_TOKEN: "{{ lookup('env','K3S_TOKEN') }}"
+        INSTALL_K3S_SKIP_START: "true"
+      shell: >
+        sh /tmp/get-k3s.sh server --cluster-init \
+          --node-external-ip={{ ansible_default_ipv4.address }} \
+          --flannel-backend=wireguard-native \
+          --flannel-external-ip
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Start k3s manually (without systemd)
+      when: "'master' in group_names and not systemd_check.stat.exists"
+      run_once: true
+      environment:
+        K3S_TOKEN: "{{ lookup('env','K3S_TOKEN') }}"
+      shell: >
+        nohup /usr/local/bin/k3s server --cluster-init \
+          --node-external-ip={{ ansible_default_ipv4.address }} \
+          --flannel-backend=wireguard-native \
+          --flannel-external-ip \
+          > /var/log/k3s.log 2>&1 &
+      async: 10
+      poll: 0
+
+    - name: Install k3s on Worker Nodes (with systemd)
+      when: "'worker' in group_names and systemd_check.stat.exists"
+      environment:
+        K3S_TOKEN: "{{ lookup('env','K3S_TOKEN') }}"
+        K3S_URL: "https://{{ hostvars[groups['master'][0]].ansible_default_ipv4.address }}:6443"
+      shell: >
+        sh /tmp/get-k3s.sh agent --server https://{{ hostvars[groups['master'][0]].ansible_default_ipv4.address }}:6443 \
+          --token $K3S_TOKEN \
+          --node-external-ip={{ ansible_default_ipv4.address }}
+      args:
+        creates: /etc/systemd/system/k3s-agent.service
+
+    - name: Install k3s on Worker Nodes (without systemd)
+      when: "'worker' in group_names and not systemd_check.stat.exists"
+      environment:
+        K3S_TOKEN: "{{ lookup('env','K3S_TOKEN') }}"
+        K3S_URL: "https://{{ hostvars[groups['master'][0]].ansible_default_ipv4.address }}:6443"
+        INSTALL_K3S_SKIP_START: "true"
+      shell: >
+        sh /tmp/get-k3s.sh agent --server https://{{ hostvars[groups['master'][0]].ansible_default_ipv4.address }}:6443 \
+          --token $K3S_TOKEN \
+          --node-external-ip={{ ansible_default_ipv4.address }}
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Start k3s agent manually (without systemd)
+      when: "'worker' in group_names and not systemd_check.stat.exists"
+      environment:
+        K3S_TOKEN: "{{ lookup('env','K3S_TOKEN') }}"
+      shell: >
+        nohup /usr/local/bin/k3s agent --server https://{{ hostvars[groups['master'][0]].ansible_default_ipv4.address }}:6443 \
+          --token $K3S_TOKEN \
+          --node-external-ip={{ ansible_default_ipv4.address }} \
+          > /var/log/k3s-agent.log 2>&1 &
+      async: 10
+      poll: 0
+    
+    - name: Wait for k3s to be ready
+      when: "'master' in group_names"
+      wait_for:
+        port: 6443
+        host: "{{ ansible_default_ipv4.address }}"
+        delay: 10
+        timeout: 300
+
+    - name: Configure kubectl for k3s
+      when: "'master' in group_names"
+      shell: |
+        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+        for i in {1..30}; do
+          if kubectl --kubeconfig=/etc/rancher/k3s/k3s.yaml get nodes; then
+            echo "k3s API server is ready"
+            break
+          fi
+          echo "Waiting for k3s API server... attempt $i"
+          sleep 10
+        done
+
+    - name: Install helm
+      when: "'master' in group_names"
+      shell: |
+        sudo apt-get install curl gpg apt-transport-https --yes
+        curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+        sudo apt-get update
+        sudo apt-get install helm -y
+
+    - name: Install Argo Workflows
+      when: "'master' in group_names"
+      run_once: true
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      shell: |
+        export ARGO_WORKFLOWS_VERSION="v3.7.2"
+        kubectl create namespace argo --dry-run=client -o yaml | kubectl apply -f -
+        kubectl apply -n argo -f "https://github.com/argoproj/argo-workflows/releases/download/${ARGO_WORKFLOWS_VERSION}/quick-start-minimal.yaml"
+
+    - name: Wait for k3s.yaml to be created
+      when: "'master' in group_names"
+      run_once: true
+      wait_for:
+        path: /etc/rancher/k3s/k3s.yaml
+        timeout: 60
+
+    - name: Read kubeconfig file from master node
+      when: "'master' in group_names"
+      run_once: true
+      slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: kubeconfig_content
+
+    - name: Save kubeconfig to local machine
+      when: "'master' in group_names"
+      run_once: true
+      become: false
+      delegate_to: localhost
+      copy:
+        content: "{{ kubeconfig_content.content | b64decode }}"
+        dest: ./kubeconfig
+        mode: '0600'

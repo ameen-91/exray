@@ -1,0 +1,44 @@
+- name: Destroy k3s cluster
+  hosts: all
+  become: true
+  tasks:
+    - name: Clean master node
+      when: "'master' in group_names"
+      block:
+        - name: Check master uninstall script
+          stat:
+            path: /usr/local/bin/k3s-uninstall.sh
+          register: master_uninstall
+        - name: Run master uninstall script
+          command: /usr/local/bin/k3s-uninstall.sh
+          when: master_uninstall.stat.exists
+        - name: Remove master data directories
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/rancher
+            - /var/lib/rancher
+            - /var/lib/kubelet
+            - /etc/systemd/system/k3s.service
+            - /etc/systemd/system/k3s.service.env
+    - name: Clean worker node
+      when: "'worker' in group_names"
+      block:
+        - name: Check worker uninstall script
+          stat:
+            path: /usr/local/bin/k3s-agent-uninstall.sh
+          register: worker_uninstall
+        - name: Run worker uninstall script
+          command: /usr/local/bin/k3s-agent-uninstall.sh
+          when: worker_uninstall.stat.exists
+        - name: Remove worker data directories
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /var/lib/rancher
+            - /var/lib/kubelet
+            - /etc/systemd/system/k3s-agent.service
+            - /etc/systemd/system/k3s-agent.service.env
+

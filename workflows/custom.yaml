@@ -1,0 +1,185 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: custom-processing-
+spec:
+  entrypoint: process-file
+  templates:
+    - name: process-file
+      inputs:
+        parameters:
+          - name: input_file_name
+            value: "{{input_file_name}}"
+          - name: python_file_name
+            value: "{{python_file_name}}"
+          - name: function_name
+            value: "{{function_name}}"
+          - name: pip_packages
+            value: "{{pip_packages}}"
+        artifacts:
+          - name: input-csv
+            path: /data/input.csv
+            s3:
+              endpoint: minio.argo.svc.cluster.local:9000
+              bucket: "inputs"
+              key: "input/{{inputs.parameters.input_file_name}}"
+              insecure: true
+              accessKeySecret:
+                name: my-minio-cred
+                key: accesskey
+              secretKeySecret:
+                name: my-minio-cred
+                key: secretkey
+          - name: python-script
+            path: /data/user_script.py
+            s3:
+              endpoint: minio.argo.svc.cluster.local:9000
+              bucket: "inputs"
+              key: "python/{{inputs.parameters.python_file_name}}"
+              insecure: true
+              accessKeySecret:
+                name: my-minio-cred
+                key: accesskey
+              secretKeySecret:
+                name: my-minio-cred
+                key: secretkey
+      container:
+        image: python:3.11-slim
+        command: [bash, -c]
+        resources:
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+        args:
+          - |
+            set -e
+            echo "=== Custom Python Processing Workflow ==="
+            echo "Input file: {{inputs.parameters.input_file_name}}"
+            echo "Python script: {{inputs.parameters.python_file_name}}"
+            echo "Function name: {{inputs.parameters.function_name}}"
+            echo "Additional packages: {{inputs.parameters.pip_packages}}"
+            
+            echo "Installing dependencies..."
+            pip install --no-cache-dir pandas numpy scikit-learn scipy 2>&1 | grep -v "Requirement already satisfied" || true
+            
+            additional_packages="{{inputs.parameters.pip_packages}}"
+            if [ -n "$additional_packages" ] && [ "$additional_packages" != "" ]; then
+              echo "Installing additional packages: $additional_packages"
+              pip install --no-cache-dir $additional_packages 2>&1 | grep -v "Requirement already satisfied" || true
+            fi
+            
+            if [ ! -f /data/input.csv ]; then
+              echo "ERROR: Input CSV file not found at /data/input.csv"
+              exit 1
+            fi
+            
+            if [ ! -f /data/user_script.py ]; then
+              echo "ERROR: Python script not found at /data/user_script.py"
+              exit 1
+            fi
+            
+            echo "Files verified successfully"
+            echo ""
+            echo "=== User Python Script ==="
+            cat /data/user_script.py
+            echo ""
+            echo "=== Starting Execution ==="
+            
+            cat > /data/execute.py << 'EOF'
+            import sys
+            import traceback
+            import pandas as pd
+            from pathlib import Path
+            
+            sys.path.insert(0, '/data')
+            
+            def main():
+                function_name = "{{inputs.parameters.function_name}}"
+                
+                try:
+                    print(f"Loading input data from /data/input.csv...")
+                    input_df = pd.read_csv('/data/input.csv')
+                    print(f"Loaded {len(input_df)} rows, {len(input_df.columns)} columns")
+                    print(f"Columns: {', '.join(input_df.columns.tolist())}")
+                    print()
+                    
+                    print(f"Importing user_script module...")
+                    import user_script
+                    print(f"Module imported successfully")
+                    
+                    if not hasattr(user_script, function_name):
+                        available = [name for name in dir(user_script) if not name.startswith('_')]
+                        print(f"ERROR: Function '{function_name}' not found in user_script.py")
+                        print(f"Available functions/variables: {', '.join(available)}")
+                        sys.exit(1)
+                    
+                    user_function = getattr(user_script, function_name)
+                    print(f"Found function '{function_name}'")
+                    print()
+                    
+                    print(f"Executing {function_name}(df)...")
+                    print("-" * 50)
+                    output_df = user_function(input_df)
+                    print("-" * 50)
+                    print(f"Function executed successfully")
+                    print()
+                    
+                    if not isinstance(output_df, pd.DataFrame):
+                        print(f"ERROR: Function must return a pandas DataFrame, got {type(output_df)}")
+                        sys.exit(1)
+                    
+                    print(f"Output DataFrame: {len(output_df)} rows, {len(output_df.columns)} columns")
+                    print(f"Columns: {', '.join(output_df.columns.tolist())}")
+                    print()
+                    
+                    print("Saving output to /data/output.csv...")
+                    output_df.to_csv('/data/output.csv', index=False)
+                    print("Output saved successfully")
+                    print()
+                    print("=== Processing Complete ===")
+                    
+                except Exception as e:
+                    print()
+                    print("=" * 50)
+                    print("ERROR: An exception occurred during processing")
+                    print("=" * 50)
+                    print(f"Error type: {type(e).__name__}")
+                    print(f"Error message: {str(e)}")
+                    print()
+                    print("Full traceback:")
+                    traceback.print_exc()
+                    sys.exit(1)
+            
+            if __name__ == "__main__":
+                main()
+            EOF
+            
+            python /data/execute.py
+            
+            if [ ! -f /data/output.csv ]; then
+              echo "ERROR: Output file was not created at /data/output.csv"
+              exit 1
+            fi
+            
+            echo ""
+            echo "Workflow completed successfully"
+      outputs:
+        artifacts:
+          - name: result-file
+            path: /data/output.csv
+            s3:
+              endpoint: minio.argo.svc.cluster.local:9000
+              bucket: "inputs"
+              key: "output/{{inputs.parameters.input_file_name}}"
+              insecure: true
+              accessKeySecret:
+                name: my-minio-cred
+                key: accesskey
+              secretKeySecret:
+                name: my-minio-cred
+                key: secretkey
+            archive:
+              none: {}

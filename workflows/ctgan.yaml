@@ -1,0 +1,82 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: ctgan-synthesis-
+spec:
+  entrypoint: process-file
+  templates:
+    - name: process-file
+      inputs:
+        parameters:
+          - name: discrete_columns
+            value: "{{discrete_columns}}"
+          - name: no_of_epochs
+            value: "{{no_of_epochs}}"
+          - name: no_of_samples
+            value: "{{no_of_samples}}"
+          - name: input_file_name
+            value: "{{input_file_name}}"
+        artifacts:
+          - name: input-file
+            path: /data/input.csv
+            s3:
+              endpoint: minio.argo.svc.cluster.local:9000
+              bucket: "inputs"
+              key: "input/{{inputs.parameters.input_file_name}}"
+              insecure: true
+              accessKeySecret:
+                name: my-minio-cred
+                key: accesskey
+              secretKeySecret:
+                name: my-minio-cred
+                key: secretkey
+      container:
+        image: ollama/ollama:latest
+        command: [bash, -c]
+        args:
+          - |
+            apt update && apt install -y curl
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            source $HOME/.local/bin/env
+            mkdir test
+            cd test
+            uv init
+            uv venv
+            source .venv/bin/activate
+            uv add ctgan
+            uv add pandas
+            cat > test.py <<EOF
+            from ctgan import CTGAN
+            import pandas as pd
+            
+            input = pd.read_csv('/data/input.csv')
+            discrete_columns_str = "{{inputs.parameters.discrete_columns}}".strip()
+            discrete_columns = [col.strip() for col in discrete_columns_str.split(',') if col.strip()]
+            no_of_epochs = int("{{inputs.parameters.no_of_epochs}}")
+            no_of_samples = int("{{inputs.parameters.no_of_samples}}")
+            ctgan = CTGAN(epochs=no_of_epochs)
+            if discrete_columns:
+              ctgan.fit(input, discrete_columns)
+            else:
+              ctgan.fit(input)
+            synthetic_data = ctgan.sample(no_of_samples)
+            synthetic_data.to_csv('/data/output.csv', index=False)
+            EOF
+            python test.py
+      outputs:
+        artifacts:
+          - name: result-file
+            path: /data/output.csv
+            s3:
+              endpoint: minio.argo.svc.cluster.local:9000
+              bucket: "inputs"
+              key: "output/{{inputs.parameters.input_file_name}}"
+              insecure: true
+              accessKeySecret:
+                name: my-minio-cred
+                key: accesskey
+              secretKeySecret:
+                name: my-minio-cred
+                key: secretkey
+            archive:
+              none: {}
