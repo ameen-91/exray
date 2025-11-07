@@ -6,13 +6,17 @@ from uuid import uuid4
 
 import requests
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from minio.error import S3Error
 
 from state import entries
 from workflows import argo
+
+DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
+INDEX_FILE = DIST_DIR / "index.html"
 
 port_forward_commands = [
     [
@@ -49,6 +53,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if DIST_DIR.exists():
+    assets_dir = DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="frontend-assets")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def frontend_favicon():
+        favicon_path = DIST_DIR / "favicon.ico"
+        if favicon_path.exists():
+            return FileResponse(favicon_path)
+        raise HTTPException(status_code=404, detail="Favicon not found")
+
 
 @app.on_event("startup")
 async def start_port_forwarding():
@@ -75,7 +91,12 @@ async def stop_port_forwarding():
 
 
 @app.get("/")
-async def home():
+async def home(request: Request):
+    accept = request.headers.get("accept", "")
+    if INDEX_FILE.exists() and "text/html" in accept:
+        return FileResponse(INDEX_FILE)
+    if INDEX_FILE.exists() and not accept:
+        return FileResponse(INDEX_FILE)
     return {"service": "exray-workflows", "runs": entries.list_runs()}
 
 
@@ -496,6 +517,17 @@ async def get_run_logs(run_id: str, tail: int = 200):
         raise HTTPException(status_code=502, detail="Failed to fetch logs") from exc
 
     return logs
+
+
+if DIST_DIR.exists():
+
+    @app.get("/{_path:path}", include_in_schema=False)
+    async def serve_spa(_path: str, request: Request):
+        accept = request.headers.get("accept", "")
+        wants_html = "text/html" in accept or "*/*" in accept or not accept
+        if INDEX_FILE.exists() and wants_html:
+            return FileResponse(INDEX_FILE)
+        raise HTTPException(status_code=404)
 
 
 if __name__ == "__main__":
